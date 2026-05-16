@@ -438,6 +438,9 @@ class GetPokeHandler:
             return None
         
         sender_name = await get_nickname(event.bot, event.get_group_id(), user_id)
+        # 如果 API 返回的是纯数字 QQ 号，替换为默认名称
+        if sender_name.isdigit():
+            sender_name = "某人"
         meme_images = [MemeImage(sender_name, avatar)]
         
         default_texts = getattr(self.cfg.meme, 'default_texts', ["戳我干嘛"])
@@ -468,6 +471,9 @@ class GetPokeHandler:
     async def _generate_text_meme(self, event, meme_manager, template, user_id: str) -> Optional[bytes]:
         """生成文字类表情包"""
         sender_name = await get_nickname(event.bot, event.get_group_id(), user_id)
+        # 如果 API 返回的是纯数字 QQ 号，替换为默认名称
+        if sender_name.isdigit():
+            sender_name = "某人"
         default_texts = getattr(self.cfg.meme, 'default_texts', ["戳我干嘛"])
         # 根据模板参数生成正确数量的文字
         params = template.info.params
