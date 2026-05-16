@@ -1,0 +1,378 @@
+# config.py
+from __future__ import annotations
+
+import random
+from collections.abc import Mapping, MutableMapping
+from pathlib import Path
+from types import MappingProxyType, UnionType
+from typing import Any, Union, get_args, get_origin, get_type_hints
+
+from astrbot.api import logger
+from astrbot.core.config.astrbot_config import AstrBotConfig
+from astrbot.core.star.context import Context
+from astrbot.core.utils.astrbot_path import (
+    get_astrbot_plugin_data_path,
+    get_astrbot_plugin_path,
+    get_astrbot_root,
+)
+from astrbot.core.utils.image_ref_utils import ALLOWED_IMAGE_EXTENSIONS
+
+from .model import PokeModel
+
+
+class ConfigNode:
+    """
+    配置节点, 把 dict 变成强类型对象。
+
+    规则：
+    - schema 来自子类类型注解
+    - 声明字段：读写，写回底层 dict
+    - 未声明字段和下划线字段：仅挂载属性，不写回
+    - 支持 ConfigNode 多层嵌套（lazy + cache）
+    """
+
+    _SCHEMA_CACHE: dict[type, dict[str, type]] = {}
+    _FIELDS_CACHE: dict[type, set[str]] = {}
+
+    @classmethod
+    def _schema(cls) -> dict[str, type]:
+        return cls._SCHEMA_CACHE.setdefault(cls, get_type_hints(cls))
+
+    @classmethod
+    def _fields(cls) -> set[str]:
+        return cls._FIELDS_CACHE.setdefault(
+            cls,
+            {k for k in cls._schema() if not k.startswith("_")},
+        )
+
+    @staticmethod
+    def _is_optional(tp: type) -> bool:
+        if get_origin(tp) in (Union, UnionType):
+            return type(None) in get_args(tp)
+        return False
+
+    def __init__(self, data: MutableMapping[str, Any]):
+        object.__setattr__(self, "_data", data)
+        object.__setattr__(self, "_children", {})
+        for key, tp in self._schema().items():
+            if key.startswith("_"):
+                continue
+            if key in data:
+                continue
+            if hasattr(self.__class__, key):
+                continue
+            if self._is_optional(tp):
+                continue
+            logger.warning(f"[config:{self.__class__.__name__}] 缺少字段: {key}")
+
+    def __getattr__(self, key: str) -> Any:
+        if key in self._fields():
+            value = self._data.get(key)
+            tp = self._schema().get(key)
+
+            if isinstance(tp, type) and issubclass(tp, ConfigNode):
+                children: dict[str, ConfigNode] = self.__dict__["_children"]
+                if key not in children:
+                    if not isinstance(value, MutableMapping):
+                        raise TypeError(
+                            f"[config:{self.__class__.__name__}] "
+                            f"字段 {key} 期望 dict，实际是 {type(value).__name__}"
+                        )
+                    children[key] = tp(value)
+                return children[key]
+
+            return value
+
+        if key in self.__dict__:
+            return self.__dict__[key]
+
+        raise AttributeError(key)
+
+    def __setattr__(self, key: str, value: Any) -> None:
+        if key in self._fields():
+            self._data[key] = value
+            return
+        object.__setattr__(self, key, value)
+
+    def raw_data(self) -> Mapping[str, Any]:
+        """
+        底层配置 dict 的只读视图
+        """
+        return MappingProxyType(self._data)
+
+    def save_config(self) -> None:
+        """
+        保存配置到磁盘（仅允许在根节点调用）
+        """
+        if not isinstance(self._data, AstrBotConfig):
+            raise RuntimeError(
+                f"{self.__class__.__name__}.save_config() 只能在根配置节点上调用"
+            )
+        self._data.save_config()
+
+
+# ============ 插件自定义配置 ==================
+
+
+class AntiPokeConfig(ConfigNode):
+    weight: int
+    max_times: int
+
+
+class LLMConfig(ConfigNode):
+    weight: int
+    template: str
+
+
+class FaceConfig(ConfigNode):
+    weight: int
+    pool: list[int]
+    max_copy_count: int
+
+
+class MemeConfig(ConfigNode):
+    """表情包配置（支持 MemeGenerator 动态生成）"""
+    weight: int
+    pool: list[str]
+    paths: list[str]
+    # MemeGenerator 相关配置
+    prefer_avatar_meme: bool = True
+    avatar_meme_ratio: float = 0.7
+    default_texts: list[str] = ["戳我干嘛", "不要戳我", "哼", "干嘛啦", "再戳就生气了", "呜呜呜"]
+    cooldown: int = 3
+    fallback_to_face: bool = True
+    # 头像缓存配置
+    cache_avatar: bool = True
+    cache_max_users: int = 20
+    cache_max_memory_mb: float = 2.0
+    cache_ttl_seconds: int = 180
+    cache_memory_pressure_mb: float = 300.0
+    cache_aggressive_threshold_mb: float = 250.0
+
+
+class RecordConfig(ConfigNode):
+    weight: int
+    pool: list[str]
+
+
+class BanConfig(ConfigNode):
+    weight: int
+    duration: int
+    delta: int
+    ban_template: str
+    ban_fail_template: str
+
+
+class CommandConfig(ConfigNode):
+    weight: int
+    pool: list[str]
+
+
+class SchedulerConfig(ConfigNode):
+    enabled: bool
+    cron: str
+    target: list[str]
+    times: int
+
+
+class PluginConfig(ConfigNode):
+    on_poke: bool
+    poke_cd: int
+    follow_prob: float
+
+    antipoke: AntiPokeConfig
+    llm: LLMConfig
+    face: FaceConfig
+    meme: MemeConfig
+    record: RecordConfig
+    ban: BanConfig
+    command: CommandConfig
+
+    poke_max_times: int
+    poke_interval: float
+    poke_keywords: list[str]
+
+    scheduler: SchedulerConfig
+
+    _plugin_name = "astrbot_plugin_pokepro"
+
+    def __init__(self, cfg: AstrBotConfig, context: Context):
+        super().__init__(cfg)
+        self.context = context
+        self.target_list = self._parse_target()
+
+        self.root_dir = Path(get_astrbot_root())
+        self.data_dir = Path(get_astrbot_plugin_data_path()) / self._plugin_name
+        self.plugin_dir = Path(get_astrbot_plugin_path()) / self._plugin_name
+        self.logo_path = self.plugin_dir / "logo.png"
+        self.file_pool_dir = self.data_dir / "files" / "meme" / "pool"
+        self.file_pool_dir.mkdir(parents=True, exist_ok=True)
+
+        self.meme_image_pool = self._collect_meme_images()
+        self._ensure_non_empty_pools()
+        self.save_config()
+
+    def _parse_target(self) -> list[tuple[str, str]]:
+        target_list = []
+        for arg in self.scheduler.target:
+            try:
+                group, qq = arg.split(":")
+                target_list.append((group, qq))
+            except ValueError:
+                pass
+        return target_list
+
+    def _ensure_non_empty_pools(self) -> None:
+        if not self.face.pool:
+            self.face.pool.append(1)
+            logger.warning("QQ表情池为空，已添加默认值：1")
+
+        if not self.command.pool:
+            self.command.pool.append("盒")
+            logger.warning("命令池为空，已添加默认值：盒")
+
+        if not self.meme_image_pool:
+            target = self.file_pool_dir / self.logo_path.name
+            default_path = "files/meme/pool/logo.png"
+            if default_path not in self.meme.pool:
+                self.meme.pool.append(default_path)
+            if not target.exists():
+                try:
+                    target.write_bytes(self.logo_path.read_bytes())
+                    logger.warning(f"表情包池为空，已复制 logo 到默认池：{target}")
+                except Exception as e:
+                    logger.error(
+                        f"复制默认表情包失败：{self.logo_path} -> {target}, {e}"
+                    )
+            self.meme_image_pool = self._collect_meme_images()
+
+    def _collect_meme_images(self) -> list[str]:
+        image_pool: list[str] = []
+        seen: set[str] = set()
+
+        for raw_path in self.meme.pool or []:
+            image_path = self._resolve_meme_pool_file(raw_path)
+            if image_path is None:
+                continue
+            resolved = str(image_path.resolve())
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            image_pool.append(resolved)
+
+        for raw_path in self.meme.paths or []:
+            search_path = self._resolve_meme_search_path(raw_path)
+            if search_path is None:
+                continue
+
+            if search_path.is_file():
+                if search_path.suffix.lower() not in ALLOWED_IMAGE_EXTENSIONS:
+                    logger.warning(f"表情包图库文件格式不受支持，已跳过：{search_path}")
+                    continue
+                candidates = [search_path]
+            elif search_path.is_dir():
+                candidates = sorted(
+                    path
+                    for path in search_path.rglob("*")
+                    if path.is_file()
+                    and path.suffix.lower() in ALLOWED_IMAGE_EXTENSIONS
+                )
+            else:
+                logger.warning(f"表情包图库路径不存在，已跳过：{search_path}")
+                continue
+
+            if not candidates:
+                logger.warning(f"表情包图库路径下未找到图片，已跳过：{search_path}")
+                continue
+
+            for image_path in candidates:
+                if image_path.suffix.lower() not in ALLOWED_IMAGE_EXTENSIONS:
+                    continue
+                resolved = str(image_path.resolve())
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                image_pool.append(resolved)
+
+        return image_pool
+
+    def _resolve_meme_pool_file(self, raw_path: str) -> Path | None:
+        if not raw_path:
+            return None
+
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            path = self.data_dir / path
+        path = path.resolve(strict=False)
+
+        if not path.exists():
+            logger.warning(f"表情包图片不存在，已跳过：{path}")
+            return None
+        if not path.is_file():
+            logger.warning(f"表情包图片路径不是文件，已跳过：{path}")
+            return None
+        if path.suffix.lower() not in ALLOWED_IMAGE_EXTENSIONS:
+            logger.warning(f"表情包图片格式不受支持，已跳过：{path}")
+            return None
+        return path
+
+    def _resolve_meme_search_path(self, raw_path: str) -> Path | None:
+        if not raw_path:
+            return None
+
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            path = self.root_dir / path
+        return path.resolve(strict=False)
+
+    # ================= 业务辅助方法 =================
+
+    def hit_poke_keywords(self, text: str) -> bool:
+        """判断是否命中关键词"""
+        return any(k in text for k in self.poke_keywords)
+
+    def get_antipoke_times(self) -> int:
+        """获取反戳次数"""
+        return random.randint(1, self.antipoke.max_times)
+
+    def get_face_copy_count(self):
+        """获取QQ表情复制次数"""
+        return random.randint(1, self.face.max_copy_count)
+
+    def get_ban_time(self) -> int:
+        """获取禁言时间"""
+        delta = random.randint(-self.ban.delta, self.ban.delta)
+        return max(0, self.ban.duration + delta)
+
+    def get_command(self):
+        """获取命令"""
+        return random.choice(self.command.pool)
+
+    def get_face(self) -> int:
+        """获取表情包"""
+        return random.choice(self.face.pool)
+
+    def get_image(self) -> str:
+        """获取图片"""
+        if not self.meme_image_pool:
+            return ""
+        return random.choice(self.meme_image_pool)
+
+    def get_record(self) -> str:
+        """获取语音"""
+        if not self.record.pool:
+            return ""
+        rel_path = Path(random.choice(self.record.pool))
+        abs_path = self.data_dir / rel_path
+        return str(abs_path.resolve())
+
+    def weight_of(self, module: PokeModel) -> int:
+        return {
+            PokeModel.ANTIPOKE: self.antipoke.weight,
+            PokeModel.LLM: self.llm.weight,
+            PokeModel.FACE: self.face.weight,
+            PokeModel.MEME: self.meme.weight,
+            PokeModel.RECORD: self.record.weight,
+            PokeModel.BAN: self.ban.weight,
+            PokeModel.COMMAND: self.command.weight,
+        }[module]
