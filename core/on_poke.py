@@ -475,9 +475,18 @@ class GetPokeHandler:
         max_texts = params.max_texts
         default_tpl_texts = params.default_texts
         
-        texts = list(default_tpl_texts) if default_tpl_texts else []
+        # 第一个文字变量必须是昵称（QQ昵称或群昵称）
+        texts = [sender_name]
+        
+        # 用模板默认文字填充剩余位置（跳过第一个，因为已经是昵称）
+        if default_tpl_texts and len(default_tpl_texts) > 1:
+            texts.extend(default_tpl_texts[1:])
+        
+        # 如果还不够最小数量，用随机预设文字填充
         while len(texts) < min_texts:
             texts.append(random.choice(default_texts))
+        
+        # 如果超过最大数量，截断
         if max_texts > 0 and len(texts) > max_texts:
             texts = texts[:max_texts]
         
