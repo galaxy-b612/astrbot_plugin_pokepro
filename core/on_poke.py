@@ -415,7 +415,7 @@ class GetPokeHandler:
                 image = await self._generate_avatar_meme(event, meme_manager, template, user_id)
             else:
                 template = random.choice(text_templates)
-                image = await self._generate_text_meme(event, meme_manager, template)
+                image = await self._generate_text_meme(event, meme_manager, template, user_id)
             
             if image:
                 self._meme_cooldown[user_id] = now
@@ -437,7 +437,7 @@ class GetPokeHandler:
         if not avatar:
             return None
         
-        sender_name = event.get_sender_name() or str(user_id)
+        sender_name = await get_nickname(event.bot, event.get_group_id(), user_id)
         meme_images = [MemeImage(sender_name, avatar)]
         
         default_texts = getattr(self.cfg.meme, 'default_texts', ["戳我干嘛"])
@@ -465,9 +465,9 @@ class GetPokeHandler:
         
         return None
 
-    async def _generate_text_meme(self, event, meme_manager, template) -> Optional[bytes]:
+    async def _generate_text_meme(self, event, meme_manager, template, user_id: str) -> Optional[bytes]:
         """生成文字类表情包"""
-        sender_name = event.get_sender_name() or "某人"
+        sender_name = await get_nickname(event.bot, event.get_group_id(), user_id)
         default_texts = getattr(self.cfg.meme, 'default_texts', ["戳我干嘛"])
         # 根据模板参数生成正确数量的文字
         params = template.info.params
