@@ -440,7 +440,7 @@ class GetPokeHandler:
         sender_name = await get_nickname(event.bot, event.get_group_id(), user_id)
         # 如果 API 返回的是纯数字 QQ 号，替换为默认名称
         if sender_name.isdigit():
-            sender_name = "某人"
+            sender_name = "嘟嘟可"
         meme_images = [MemeImage(sender_name, avatar)]
         
         default_texts = getattr(self.cfg.meme, 'default_texts', ["戳我干嘛"])
