@@ -328,7 +328,16 @@ class GetPokeHandler:
             avatar_memes = []
             text_memes = []
             
+            # 获取禁用模板列表
+            disabled = []
+            meme_mgr = self._get_meme_manager()
+            if meme_mgr and hasattr(meme_mgr.config, 'disabled_templates'):
+                disabled = meme_mgr.config.disabled_templates
+            
             for meme in all_memes:
+                # 跳过被禁用的模板
+                if meme.key in disabled:
+                    continue
                 params = meme.info.params
                 if params.min_images >= 1:
                     avatar_memes.append(meme)
@@ -371,25 +380,25 @@ class GetPokeHandler:
             logger.debug(f"[戳一戳] 获取头像失败: {e}")
             return None
 
-    async def _generate_meme_image(self, event: AiocqhttpMessageEvent, user_id: str) -> Optional[bytes]:
-        """使用 MemeGenerator 生成表情包"""
+    async def _generate_meme_image(self, event: AiocqhttpMessageEvent, user_id: str):
+        """使用 MemeGenerator 生成表情包，返回 (image_bytes, template_key) 或 (None, None)"""
         
         # 冷却检查
         now = time.time()
         cooldown = getattr(self.cfg.meme, 'cooldown', 3)
         if now - self._meme_cooldown.get(user_id, 0) < cooldown:
-            return None
+            return None, None
         
         meme_manager = self._get_meme_manager()
         if not meme_manager:
-            return None
+            return None, None
         
         # 检查资源状态
         if hasattr(meme_manager, 'resource_status'):
             rs = meme_manager.resource_status
             if hasattr(rs, 'ready') and not rs.ready:
                 logger.debug("[戳一戳] MemeGenerator 资源未就绪")
-                return None
+                return None, None
         
         # 刷新模板缓存
         await self._refresh_meme_templates()
@@ -398,7 +407,7 @@ class GetPokeHandler:
         text_templates = self._meme_templates.text_templates
         
         if not avatar_templates and not text_templates:
-            return None
+            return None, None
         
         # 选择模板类型
         prefer_avatar = getattr(self.cfg.meme, 'prefer_avatar_meme', True)
@@ -412,30 +421,32 @@ class GetPokeHandler:
         try:
             if use_avatar:
                 template = random.choice(avatar_templates)
-                image = await self._generate_avatar_meme(event, meme_manager, template, user_id)
+                image, _ = await self._generate_avatar_meme(event, meme_manager, template, user_id)
+                template_key = template.key
             else:
                 template = random.choice(text_templates)
-                image = await self._generate_text_meme(event, meme_manager, template, user_id)
+                image, _ = await self._generate_text_meme(event, meme_manager, template, user_id)
+                template_key = template.key
             
             if image:
                 self._meme_cooldown[user_id] = now
-                return image
+                return image, template_key
             
         except Exception as e:
             logger.error(f"[戳一戳] 生成表情包失败: {e}")
         
-        return None
+        return None, None
 
-    async def _generate_avatar_meme(self, event, meme_manager, template, user_id: str) -> Optional[bytes]:
-        """生成头像类表情包"""
+    async def _generate_avatar_meme(self, event, meme_manager, template, user_id: str):
+        """生成头像类表情包，返回 (image_bytes, template_key)"""
         try:
             from meme_generator import Image as MemeImage
         except ImportError:
-            return None
+            return None, None
         
         avatar = await self._get_cached_avatar(user_id)
         if not avatar:
-            return None
+            return None, None
         
         sender_name = await get_nickname(event.bot, event.get_group_id(), user_id)
         # 如果 API 返回的是纯数字 QQ 号，替换为默认名称
@@ -460,16 +471,17 @@ class GetPokeHandler:
             image_generator = meme_manager.image_generator
             
             if hasattr(image_generator, 'generate_image'):
-                return await image_generator.generate_image(
+                result = await image_generator.generate_image(
                     template, meme_images, texts, {"name": sender_name}, timeout
                 )
+                return result, template.key
         except Exception as e:
             logger.error(f"[戳一戳] 头像表情包生成失败: {e}")
         
-        return None
+        return None, None
 
-    async def _generate_text_meme(self, event, meme_manager, template, user_id: str) -> Optional[bytes]:
-        """生成文字类表情包"""
+    async def _generate_text_meme(self, event, meme_manager, template, user_id: str):
+        """生成文字类表情包，返回 (image_bytes, template_key)"""
         sender_name = await get_nickname(event.bot, event.get_group_id(), user_id)
         # 如果 API 返回的是纯数字 QQ 号，替换为默认名称
         if sender_name.isdigit():
@@ -501,13 +513,14 @@ class GetPokeHandler:
             image_generator = meme_manager.image_generator
             
             if hasattr(image_generator, 'generate_image'):
-                return await image_generator.generate_image(
+                result = await image_generator.generate_image(
                     template, [], texts, {"name": sender_name}, timeout
                 )
+                return result, template.key
         except Exception as e:
             logger.error(f"[戳一戳] 文字表情包生成失败: {e}")
         
-        return None
+        return None, None
 
     async def handle(self, event: AiocqhttpMessageEvent):
         """响应戳一戳事件"""
@@ -615,11 +628,21 @@ class GetPokeHandler:
         user_id = event.get_sender_id()
         
         # 尝试 MemeGenerator
-        meme_image = await self._generate_meme_image(event, user_id)
+        meme_image, template_key = await self._generate_meme_image(event, user_id)
         
         if meme_image:
-            logger.debug(f"[戳一戳] 成功生成 MemeGenerator 表情包，用户: {user_id}")
-            yield event.chain_result([CompImage.fromBytes(meme_image)])
+            logger.debug(f"[戳一戳] 成功生成 MemeGenerator 表情包，用户: {user_id}, 模板: {template_key}")
+            # 查询 Yunzai 指令关键词
+            yun_keyword = None
+            if template_key:
+                meme_mgr = self._get_meme_manager()
+                if meme_mgr and hasattr(meme_mgr, 'get_yunzai_keyword'):
+                    yun_keyword = meme_mgr.get_yunzai_keyword(template_key)
+            
+            if yun_keyword:
+                yield event.chain_result([Plain(f"这个表情的指令是 {yun_keyword}"), CompImage.fromBytes(meme_image)])
+            else:
+                yield event.chain_result([CompImage.fromBytes(meme_image)])
             return
         
         # 回退1：静态图片池
